@@ -40,12 +40,14 @@ fixtures = [
 					"Delivery Note-shopify_order_id",
 					"Delivery Note-shopify_order_number",
 					"Delivery Note-shopify_fulfillment_id",
+					"Delivery Note-shopify_financial_status",
 					"Delivery Note-shopify_customer_note",
 					# Sales Invoice fields
 					"Sales Invoice-shopify_section",
 					"Sales Invoice-shopify_store",
 					"Sales Invoice-shopify_order_id",
 					"Sales Invoice-shopify_order_number",
+					"Sales Invoice-shopify_financial_status",
 					"Sales Invoice-shopify_customer_note",
 					# Contact Phone fields
 					"Contact Phone-shopify_original_phone",
