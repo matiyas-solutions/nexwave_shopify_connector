@@ -17,6 +17,12 @@ Webhook-based order ingestion with HMAC validation. Orders are automatically rou
 ### Fulfillment Sync
 Listens to Shopify fulfillment webhooks and automatically creates Delivery Notes with tracking information. Handles partial fulfillments and prevents duplicates.
 
+With NZ customisations installed, warehouses using **Stage Before Dispatch** consume already staged Pick Lists. Partial deliveries retain the exact order row, pick row, staging bin and batch allocation. Complete physical picking and staging before the Shopify fulfillment arrives; the connector does not perform those warehouse operations. A shortage, an existing draft delivery, or an active warehouse dispatch task blocks automatic delivery and leaves the event retryable. Serial-tracked items and Product Bundles remain subject to NZ's staging restrictions.
+
+New order imports retain Shopify line IDs. Older orders can use a unique matching item; repeated items without line IDs require their source identities to be resolved before automatic staged delivery. Run the normal site migration when upgrading to add the line-ID field.
+
+Each physical source allocation must fit the order's sales UOM at Delivery Note quantity precision. Allocations that cannot be represented exactly stop before stock moves. NZ integration tests use customisations v1.59.7 and the framework versions pinned in CI.
+
 ### Product and Inventory Push
 Sync items from ERPNext to Shopify with configurable field mapping (standard fields and metafields). Push stock levels from ERPNext warehouses to Shopify locations with multi-location support.
 

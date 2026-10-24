@@ -11,7 +11,16 @@ on:
       - develop
       - version-*
 
+permissions:
+  contents: read
+
 env:
+  # Keep the optional NZ integration on its tested v15 dependency set.
+  NZ_FRAPPE_VERSION: v15.121.3
+  NZ_ERPNEXT_VERSION: v15.121.6
+  NZ_HRMS_VERSION: v15.64.6
+  NZ_PAYMENTS_COMMIT: 9885a6e500104f1f160add47d55b370773e67a81
+  NZ_COMMIT: 6daba050c72a295c1d475ce4f08a2c4cef2f02c0 # v1.59.7
   BRANCH: ${{ github.base_ref || github.ref_name }}
 
 concurrency:
@@ -20,10 +29,17 @@ concurrency:
 
 jobs:
   tests:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     timeout-minutes: 60
     if: "!contains(github.event.head_commit.message, 'chore(release):')"
-    name: Server
+    name: Server tests (${{ matrix.integration }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # NZ supports v15; preserve the plain suite for other target branches.
+        integration: ${{ fromJSON((github.base_ref || github.ref_name) == 'version-15' && '["plain", "nz"]' || '["plain"]') }}
+    env:
+      INTEGRATION: ${{ matrix.integration }}
 
     services:
       redis-cache:
@@ -47,9 +63,6 @@ jobs:
     steps:
       - name: Clone
         uses: actions/checkout@v4
-
-      - name: Clean previous bench
-        run: rm -rf ${{ github.workspace }}/../frappe-bench
 
       - name: Find tests
         run: |
@@ -93,23 +106,50 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq mariadb-client pkg-config
 
+      - name: Clone pinned NZ integration
+        if: matrix.integration == 'nz'
+        uses: actions/checkout@v4
+        with:
+          repository: one-highflyer/erpnext_new_zealand_customizations
+          ref: ${{ env.NZ_COMMIT }}
+          path: .ci-dependencies/erpnext_new_zealand_customizations
+
       - name: Setup
         run: |
           pip install frappe-bench
-          bench init --skip-redis-config-generation --skip-assets --python "$(which python)" --frappe-branch "$BRANCH" ${{ github.workspace }}/../frappe-bench
+          frappe_branch="$BRANCH"
+          if [[ "$INTEGRATION" == "nz" ]]; then
+            frappe_branch="$NZ_FRAPPE_VERSION"
+          fi
+          bench init --skip-redis-config-generation --skip-assets --python "$(which python)" --frappe-branch "$frappe_branch" "${{ github.workspace }}/../frappe-bench"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL character_set_server = 'utf8mb4'"
           mariadb --host 127.0.0.1 --port 3306 -u root -proot -e "SET GLOBAL collation_server = 'utf8mb4_unicode_ci'"
 
       - name: Install
         working-directory: ${{ github.workspace }}/../frappe-bench
         run: |
-          bench get-app erpnext --branch "$BRANCH"
-          bench get-app nexwave_shopify_connector $GITHUB_WORKSPACE
+          if [[ "$INTEGRATION" == "nz" ]]; then
+            bench get-app --skip-assets erpnext --branch "$NZ_ERPNEXT_VERSION"
+            bench get-app --skip-assets hrms --branch "$NZ_HRMS_VERSION"
+            bench get-app --skip-assets payments --branch version-15
+            git -C apps/payments fetch --depth 1 upstream "$NZ_PAYMENTS_COMMIT"
+            git -C apps/payments checkout --detach "$NZ_PAYMENTS_COMMIT"
+            bench get-app --skip-assets erpnext_new_zealand_customizations "$GITHUB_WORKSPACE/.ci-dependencies/erpnext_new_zealand_customizations"
+          else
+            bench get-app --skip-assets erpnext --branch "$BRANCH"
+          fi
+          bench get-app --skip-assets nexwave_shopify_connector "$GITHUB_WORKSPACE"
           bench setup requirements --dev
           bench new-site --db-root-password root --admin-password admin test_site
           bench --site test_site install-app erpnext
+          if [[ "$INTEGRATION" == "nz" ]]; then
+            bench --site test_site install-app hrms
+            bench --site test_site install-app payments
+            bench --site test_site install-app erpnext_new_zealand_customizations
+          fi
           bench --site test_site install-app nexwave_shopify_connector
           bench build
+          bench version
         env:
           CI: "Yes"
 
@@ -121,3 +161,12 @@ jobs:
           bench --site test_site run-tests --app nexwave_shopify_connector
         env:
           TYPE: server
+
+  server:
+    name: Server
+    runs-on: ubuntu-latest
+    needs: tests
+    if: always() && !contains(github.event.head_commit.message, 'chore(release):')
+    steps:
+      - name: Check server test lanes
+        run: test "${{ needs.tests.result }}" = "success"
