@@ -235,6 +235,11 @@ class TestOrderItemMapping(FrappeTestCase):
 
 		self.assertEqual(items[0]["item_code"], self.item_code)
 
+	def test_import_retains_remote_line_identity(self):
+		"""Fulfillment can identify an exact source row even after its SKU changes."""
+		items = self.get_order_items(id=101)
+		self.assertEqual(items[0]["shopify_line_item_id"], "101")
+
 	def test_unknown_sku_uses_variant_mapping(self):
 		items = self.get_order_items(sku="outdated-sku")
 
