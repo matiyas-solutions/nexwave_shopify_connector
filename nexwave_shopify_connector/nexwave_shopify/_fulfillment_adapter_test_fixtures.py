@@ -6,6 +6,7 @@
 from typing import ClassVar
 
 import frappe
+from frappe import _
 
 from nexwave_shopify_connector.nexwave_shopify.fulfillment_adapter import resolve_fulfillment_demands
 
@@ -63,20 +64,20 @@ class InvalidRowAdapter(RecordingAdapter):
 class ConstructorFailureAdapter:
 	def __init__(self):
 		frappe.get_doc({"doctype": "ToDo", "description": "Synthetic adapter constructor failure"}).insert()
-		frappe.throw("Synthetic adapter constructor failure")
+		frappe.throw(_("Synthetic adapter constructor failure"))
 
 
 class PreparationFailureAdapter(RecordingAdapter):
 	def prepare_sources(self, sales_order, order, store, warehouses):
 		frappe.get_doc({"doctype": "ToDo", "description": "Adapter preparation " + sales_order.name}).insert()
-		frappe.throw("Synthetic adapter preparation failure")
+		frappe.throw(_("Synthetic adapter preparation failure"))
 
 
 class LaterFailureAdapter(RecordingAdapter):
 	def get_delivery_items(self, sales_order, line_items, warehouse, store):
 		super().get_delivery_items(sales_order, line_items, warehouse, store)
 		if len(self.calls) > 2:
-			frappe.throw("Synthetic adapter item failure")
+			frappe.throw(_("Synthetic adapter item failure"))
 		return None
 
 
