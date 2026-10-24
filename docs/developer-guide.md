@@ -91,7 +91,7 @@ class DeliveryAdapter:
 
 One instance serves the entire fulfillment operation. `prepare_sources` runs once before the connector locks and refreshes the submitted Sales Order. `get_delivery_items` receives that refreshed order for each successful fulfillment that has not already been processed. `order` and `line_items` contain the Shopify payload, `store` is its Shopify Store document, and `warehouses` is the set resolved from the payload's location mappings.
 
-Only `None` requests default item mapping. An empty list supplies no product rows; the connector's configured shipping augmentation still applies. A provider error or invalid return value rolls back the operation, including deliveries created for earlier fulfillments in the same payload. Multiple configured providers fail before any provider is invoked.
+Only `None` requests default item mapping. An empty list supplies no product rows; the connector's configured shipping augmentation still applies. The connector copies returned rows before augmentation, so an adapter can reuse its own item list across fulfillments. A provider error or invalid return value rolls back the operation, including deliveries created for earlier fulfillments in the same payload. Multiple configured providers fail before any provider is invoked.
 
 The connector owns fulfillment deduplication, the Sales Order lock, shipping augmentation, Delivery Note submission and the transaction. Adapters must not commit, roll back, submit deliveries, or perform external side effects. They must acquire the complete source-lock scope during preparation and reject source changes that would require more locks after the Sales Order is locked. Workflow-specific rules and integration tests belong to the providing app.
 

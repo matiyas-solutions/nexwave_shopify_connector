@@ -51,6 +51,19 @@ class EmptyItemsAdapter(RecordingAdapter):
 		return []
 
 
+class ReusedItemsAdapter(CustomItemsAdapter):
+	"""Return the same owned item list for successive fulfillment requests."""
+
+	def __init__(self):
+		super().__init__()
+		self.cached_items = None
+
+	def get_delivery_items(self, sales_order, line_items, warehouse, store):
+		if self.cached_items is None:
+			self.cached_items = super().get_delivery_items(sales_order, line_items, warehouse, store)
+		return self.cached_items
+
+
 class InvalidItemsAdapter(RecordingAdapter):
 	def get_delivery_items(self, sales_order, line_items, warehouse, store):
 		return {"qty": 1}

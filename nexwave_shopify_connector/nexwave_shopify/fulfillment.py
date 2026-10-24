@@ -363,6 +363,9 @@ def _create_delivery_note_from_fulfillment(
 			store=store,
 			so_name=so.name,
 		)
+	else:
+		# Providers may reuse their rows across fulfillments; shipping is local.
+		dn_items = [dict(item) for item in dn_items]
 
 	# Add shipping items if configured
 	if store.add_shipping_as_item and store.shipping_item:
