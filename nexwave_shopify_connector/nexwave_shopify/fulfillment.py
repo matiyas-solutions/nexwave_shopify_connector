@@ -5,6 +5,7 @@ import frappe
 from frappe import _
 from frappe.utils import cstr
 
+from nexwave_shopify_connector.nexwave_shopify.fulfillment_adapter import get_fulfillment_adapter
 from nexwave_shopify_connector.nexwave_shopify.utils import create_shopify_log
 from nexwave_shopify_connector.utils.logger import get_logger
 
@@ -163,14 +164,15 @@ def _create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 		}
 
 	so = frappe.get_doc("Sales Order", so_name)
-	from nexwave_shopify_connector.nexwave_shopify.staged_dispatch import lock_dispatch_sources
+	adapter = get_fulfillment_adapter()
 
 	warehouses = {
 		_get_warehouse_for_location(store, cstr(value.get("location_id") or "")) or store.warehouse
 		for value in order.get("fulfillments", [])
 	}
-	lock_dispatch_sources(so, warehouses - {None, ""})
-	# Serialize webhook retries after taking the same stock lock order as WMS.
+	if adapter is not None:
+		adapter.prepare_sources(so, order, store, warehouses - {None, ""})
+	# Providers prepare source locks before order locking and retry deduplication.
 	so = frappe.get_doc("Sales Order", so_name, for_update=True)
 	if so.docstatus != 1 or so.shopify_store != store.name or so.shopify_order_id != shopify_order_id:
 		frappe.throw(_("The Shopify Sales Order changed while fulfillment was waiting. Retry the event."))
@@ -244,6 +246,7 @@ def _create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 			store=store,
 			shopify_order_id=shopify_order_id,
 			order=order,
+			adapter=adapter,
 		)
 
 		if dn_name:
@@ -279,6 +282,7 @@ def _create_delivery_note_from_fulfillment(
 	store,
 	shopify_order_id: str,
 	order: dict,
+	adapter=None,
 ) -> str | None:
 	"""
 	Create a single Delivery Note from a Shopify fulfillment.
@@ -342,9 +346,15 @@ def _create_delivery_note_from_fulfillment(
 		len(line_items),
 		len(so.items),
 	)
-	from nexwave_shopify_connector.nexwave_shopify.staged_dispatch import get_staged_delivery_items
-
-	dn_items = get_staged_delivery_items(so, line_items, warehouse or store.warehouse, store)
+	dn_items = (
+		adapter.get_delivery_items(so, line_items, warehouse or store.warehouse, store)
+		if adapter is not None
+		else None
+	)
+	if dn_items is not None and (
+		not isinstance(dn_items, list) or any(not isinstance(item, dict) for item in dn_items)
+	):
+		frappe.throw(_("The Shopify fulfillment adapter must return None or a list of item dictionaries."))
 	if dn_items is None:
 		dn_items = _get_fulfillment_items(
 			so_items=so.items,

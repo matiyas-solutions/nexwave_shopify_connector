@@ -17,13 +17,9 @@ Webhook-based order ingestion with HMAC validation. Orders are automatically rou
 ### Fulfillment Sync
 Listens to Shopify fulfillment webhooks and automatically creates Delivery Notes with tracking information. Handles partial fulfillments and prevents duplicates.
 
-With NZ customisations installed, warehouses using **Stage Before Dispatch** consume already staged Pick Lists. Partial deliveries retain the exact order row, pick row, staging bin and batch allocation. Complete physical picking and staging before the Shopify fulfillment arrives; the connector does not perform those warehouse operations. A shortage, an existing draft delivery, or an active warehouse dispatch task blocks automatic delivery and leaves the event retryable. Serial-tracked items and Product Bundles remain subject to NZ's staging restrictions.
+Uses standard ERPNext Delivery Notes by default. Other apps can register a generic [fulfillment adapter](docs/developer-guide.md#fulfillment-adapters) to supply delivery items for their own workflows. The connector owns submission, shipping, duplicate prevention and transaction rollback.
 
-New order imports retain Shopify line IDs. Older orders can use a unique matching item; repeated items without line IDs require their source identities to be resolved before automatic staged delivery. Run the normal site migration when upgrading to add the line-ID field.
-
-Each physical source allocation must fit the order's sales UOM at Delivery Note quantity precision. Allocations that cannot be represented exactly stop before stock moves. NZ integration tests were verified with customisations v1.59.7 (`6daba050c72a295c1d475ce4f08a2c4cef2f02c0`), Frappe v15.121.3, ERPNext v15.121.6, HRMS v15.64.6 and Payments `9885a6e500104f1f160add47d55b370773e67a81`.
-
-The normal CI suite requires only ERPNext. To run the optional staged-dispatch integration tests, install NZ customisations and its dependencies on a blank test site, enable tests, then run `bench --site <test-site> run-tests --app nexwave_shopify_connector --module nexwave_shopify_connector.nexwave_shopify.test_staged_dispatch`. These cases skip when NZ is absent.
+New order imports retain Shopify line IDs for exact source-row resolution. Run the normal site migration when upgrading to add the hidden line-ID field.
 
 ### Product and Inventory Push
 Sync items from ERPNext to Shopify with configurable field mapping (standard fields and metafields). Push stock levels from ERPNext warehouses to Shopify locations with multi-location support.
