@@ -13,31 +13,33 @@ class StagedDispatchFixture:
 	def __init__(self):
 		from erpnext_new_zealand_customizations.nexwave_bin_management.tests.fixtures import (
 			TEST_BIN_WAREHOUSE_ID,
-			get_default_bin,
-			get_regular_bin,
 		)
 
 		self.warehouse = TEST_BIN_WAREHOUSE_ID
-		self.rack = get_regular_bin()
-		self.other_rack = get_default_bin()
 		frappe.db.set_value(
 			"Warehouse", self.warehouse, {"enable_wms": 1, "outbound_bin_mode": "Stage Before Dispatch"}
 		)
 		frappe.clear_document_cache("Warehouse", self.warehouse)
-		self.stage = (
+		self.rack = self.make_bin("Storage")
+		self.other_rack = self.make_bin("Storage")
+		self.stage = self.make_bin("Outbound Staging")
+		self.store = self.make_store()
+		self.item = self.make_item()
+
+	def make_bin(self, bin_type):
+		"""Create isolated bins with an explicit current operational type."""
+		return (
 			frappe.get_doc(
 				{
 					"doctype": "Warehouse Bin",
 					"warehouse": self.warehouse,
-					"bin_code": "SHOP-" + frappe.generate_hash(length=8),
-					"bin_type": "Outbound Staging",
+					"bin_code": "SHOP-" + frappe.generate_hash(length=10),
+					"bin_type": bin_type,
 				}
 			)
 			.insert()
 			.name
 		)
-		self.store = self.make_store()
-		self.item = self.make_item()
 
 	def make_store(self):
 		"""Create a disabled store with an explicit test company and warehouse."""

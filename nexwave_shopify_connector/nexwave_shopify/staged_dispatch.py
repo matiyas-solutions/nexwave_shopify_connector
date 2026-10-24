@@ -25,14 +25,17 @@ def _pick_names(so_name, warehouses, *, for_update=False):
 	"""Read candidate source picks in deterministic order, using current locks."""
 	if not warehouses:
 		return []
+	query = (
+		"SELECT DISTINCT pl.name, pl.creation FROM `tabPick List` pl "
+		"JOIN `tabPick List Item` row ON row.parent=pl.name "
+		"WHERE pl.docstatus=1 AND pl.purpose='Delivery' "
+		"AND row.sales_order=%s AND row.warehouse IN %s "
+		"ORDER BY pl.creation, pl.name"
+	)
 	return [
 		row.name
 		for row in frappe.db.sql(
-			"SELECT DISTINCT pl.name, pl.creation FROM `tabPick List` pl "
-			"JOIN `tabPick List Item` row ON row.parent=pl.name "
-			"WHERE pl.docstatus=1 AND pl.purpose='Delivery' "
-			"AND row.sales_order=%s AND row.warehouse IN %s "
-			"ORDER BY pl.creation, pl.name" + (" FOR UPDATE" if for_update else ""),
+			query + (" FOR UPDATE" if for_update else ""),
 			(so_name, tuple(warehouses)),
 			as_dict=True,
 		)
@@ -190,11 +193,14 @@ def get_staged_delivery_items(so, lines, warehouse, store):
 	if not staged:
 		return [] if not demands else None
 	if picks:
+		query = (
+			"SELECT DISTINCT parent FROM `tabPick List Item` WHERE parent IN %s "
+			"AND sales_order=%s AND sales_order_item IN %s AND warehouse=%s FOR UPDATE"
+		)
 		relevant = {
 			row.parent
 			for row in frappe.db.sql(
-				"SELECT DISTINCT parent FROM `tabPick List Item` WHERE parent IN %s "
-				"AND sales_order=%s AND sales_order_item IN %s AND warehouse=%s FOR UPDATE",
+				query,
 				(tuple(picks), so.name, tuple(staged), warehouse),
 				as_dict=True,
 			)

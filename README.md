@@ -21,7 +21,9 @@ With NZ customisations installed, warehouses using **Stage Before Dispatch** con
 
 New order imports retain Shopify line IDs. Older orders can use a unique matching item; repeated items without line IDs require their source identities to be resolved before automatic staged delivery. Run the normal site migration when upgrading to add the line-ID field.
 
-Each physical source allocation must fit the order's sales UOM at Delivery Note quantity precision. Allocations that cannot be represented exactly stop before stock moves. NZ integration tests use customisations v1.59.7 and the framework versions pinned in CI.
+Each physical source allocation must fit the order's sales UOM at Delivery Note quantity precision. Allocations that cannot be represented exactly stop before stock moves. NZ integration tests were verified with customisations v1.59.7 (`6daba050c72a295c1d475ce4f08a2c4cef2f02c0`), Frappe v15.121.3, ERPNext v15.121.6, HRMS v15.64.6 and Payments `9885a6e500104f1f160add47d55b370773e67a81`.
+
+The normal CI suite requires only ERPNext. To run the optional staged-dispatch integration tests, install NZ customisations and its dependencies on a blank test site, enable tests, then run `bench --site <test-site> run-tests --app nexwave_shopify_connector --module nexwave_shopify_connector.nexwave_shopify.test_staged_dispatch`. These cases skip when NZ is absent.
 
 ### Product and Inventory Push
 Sync items from ERPNext to Shopify with configurable field mapping (standard fields and metafields). Push stock levels from ERPNext warehouses to Shopify locations with multi-location support.
