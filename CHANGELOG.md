@@ -1,3 +1,11 @@
+## [15.1.6](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.5...v15.1.6) (2026-10-24)
+
+
+### Bug Fixes
+
+* **fulfillment:** dispatch Shopify orders from staged pick allocations ([c573a22](https://github.com/one-highflyer/nexwave_shopify_connector/commit/c573a2275607390c2e8ca6bd2e7fea8fa68d56c1))
+* **fulfillment:** isolate adapter rows before shipping augmentation ([3e1aed4](https://github.com/one-highflyer/nexwave_shopify_connector/commit/3e1aed4c2fe4339adc97008d26b1006cccbf0d30))
+
 ## [15.1.5](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.4...v15.1.5) (2026-08-31)
 
 
