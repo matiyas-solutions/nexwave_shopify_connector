@@ -1,3 +1,10 @@
+# [15.2.0](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.7...v15.2.0) (2026-10-25)
+
+
+### Features
+
+* **shopify:** auto-link order items and sync initial inventory ([406490d](https://github.com/one-highflyer/nexwave_shopify_connector/commit/406490d0d9d8077a4deecc7d108f4e9352d3263b))
+
 ## [15.1.7](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.6...v15.1.7) (2026-10-25)
 
 
