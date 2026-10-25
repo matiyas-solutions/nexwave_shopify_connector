@@ -23,7 +23,11 @@ from nexwave_shopify_connector.nexwave_shopify.inventory import (
 	sync_single_item_inventory,
 	sync_store_inventory,
 )
-from nexwave_shopify_connector.nexwave_shopify.inventory_graphql import BatchResult, ShopifyGraphQLError
+from nexwave_shopify_connector.nexwave_shopify.inventory_graphql import (
+	BatchResult,
+	ShopifyGraphQLError,
+	set_inventory_batch,
+)
 
 
 @contextmanager
@@ -118,6 +122,127 @@ class TestPendingInventorySync(FrappeTestCase):
 			{"shopify_location_id": "pending-location-2", "erpnext_warehouse": self.warehouse},
 		)
 		self.store.save(ignore_permissions=True)
+
+	@contextmanager
+	def _real_batch_with_graphql_response(self, response):
+		"""Run the actual acknowledgment parser while faking only the Shopify response."""
+		previous_side_effect = self.shopify_set.side_effect
+		self.shopify_set.side_effect = set_inventory_batch
+		try:
+			with patch(
+				"nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql",
+				return_value=response,
+			) as graphql:
+				yield graphql
+		finally:
+			self.shopify_set.side_effect = previous_side_effect
+
+	def _noop_response(self):
+		return {"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}}}
+
+	def test_full_sync_clears_pending_on_explicit_noop_at_all_locations(self):
+		second_row = self._add_mapping(self.item.name, "pending-variant-2")
+		self._add_second_location()
+		with self._real_batch_with_graphql_response(self._noop_response()) as graphql:
+			sync_store_inventory(self.store.name, force=True)
+			self.assertEqual(graphql.call_count, 2)
+			for graphql_call in graphql.call_args_list:
+				self.assertEqual(len(graphql_call.args[1]["input"]["quantities"]), 2)
+		self.assertEqual(self.shopify_set.call_count, 2)
+		for batch_call in self.shopify_set.call_args_list:
+			self.assertEqual([quantity["item_code"] for quantity in batch_call.args[0]], [self.item.name] * 2)
+		self.assertEqual(self._pending(), 0)
+		self.assertEqual(self._pending(second_row), 0)
+		self.store.reload()
+		self.assertIsNotNone(self.store.last_inventory_sync)
+
+	def test_targeted_sync_clears_only_selected_pending_item_on_explicit_noop(self):
+		other_item = ensure_test_item(self.OTHER_ITEM_CODE)
+		other_row = self._add_mapping(other_item.name, "pending-other-variant")
+		with self._real_batch_with_graphql_response(self._noop_response()) as graphql:
+			stats = sync_items_inventory(self.store.name, [self.item.name], source="order_auto_link")
+			graphql.assert_called_once()
+		self.assertEqual(stats["synced"], 1)
+		self.assertEqual(stats["errors"], 0)
+		self.assertEqual(self._pending(), 0)
+		self.assertEqual(self._pending(other_row), 1)
+
+	def test_single_item_sync_clears_pending_on_explicit_noop(self):
+		with self._real_batch_with_graphql_response(self._noop_response()) as graphql:
+			sync_single_item_inventory(self.item.name, self.store.name)
+			graphql.assert_called_once()
+		self.assertEqual(self._pending(), 0)
+
+	def test_changed_bins_acknowledges_explicit_noop_without_stock_changes(self):
+		cursor = add_to_date(now_datetime(), minutes=-60)
+		self._set_store_values(inventory_sync_mode="Changed Bins", last_inventory_sync=cursor)
+		frappe.db.set_value(
+			"Bin",
+			{"item_code": self.item.name, "warehouse": self.warehouse},
+			"modified",
+			add_to_date(cursor, minutes=-60),
+			update_modified=False,
+		)
+		with self._real_batch_with_graphql_response(self._noop_response()) as graphql:
+			sync_changed_bin_inventory(self.store.name, force=True)
+			graphql.assert_called_once()
+		self.assertEqual(self._pending(), 0)
+		self.store.reload()
+		self.assertGreater(self.store.last_inventory_sync, cursor)
+		self.assertNotIn(
+			self.item.name,
+			_get_changed_inventory_item_codes(self.store, self.store.last_inventory_sync, now_datetime()),
+		)
+
+	def test_null_group_with_user_error_keeps_all_sibling_variants_pending(self):
+		second_row = self._add_mapping(self.item.name, "pending-variant-2")
+		response = {
+			"data": {
+				"inventorySetQuantities": {
+					"inventoryAdjustmentGroup": None,
+					"userErrors": [
+						{
+							"field": ["input", "quantities", "0", "quantity"],
+							"message": "Inventory is unavailable at the requested location",
+							"code": "INVENTORY_ITEM_NOT_FOUND",
+						}
+					],
+				}
+			}
+		}
+		with self._real_batch_with_graphql_response(response) as graphql:
+			stats = sync_items_inventory(self.store.name, [self.item.name])
+			graphql.assert_called_once()
+		self.assertEqual(stats["synced"], 0)
+		self.assertEqual(stats["errors"], 2)
+		self.assertEqual(self._pending(), 1)
+		self.assertEqual(self._pending(second_row), 1)
+
+	def test_missing_group_or_malformed_response_never_clears_pending(self):
+		for response in (
+			{"data": {"inventorySetQuantities": {"userErrors": []}}},
+			{"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None}}},
+			{"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": [], "userErrors": []}}},
+			{"data": {"inventorySetQuantities": None}},
+		):
+			with self.subTest(response=response):
+				with self._real_batch_with_graphql_response(response) as graphql:
+					stats = sync_items_inventory(self.store.name, [self.item.name])
+					graphql.assert_called_once()
+				self.assertEqual(stats["synced"], 0)
+				self.assertEqual(stats["errors"], 1)
+				self.assertEqual(self._pending(), 1)
+
+	def test_changed_bins_retains_pending_and_cursor_when_group_is_missing(self):
+		cursor = add_to_date(now_datetime(), minutes=-60)
+		self._set_store_values(inventory_sync_mode="Changed Bins", last_inventory_sync=cursor)
+		response = {"data": {"inventorySetQuantities": {"userErrors": []}}}
+		with self._real_batch_with_graphql_response(response) as graphql:
+			sync_changed_bin_inventory(self.store.name, force=True)
+			graphql.assert_called_once()
+		self.assertEqual(self._pending(), 1)
+		self.store.reload()
+		self.assertEqual(self.store.last_inventory_sync, cursor)
 
 	def test_pending_mapping_is_selected_without_stock_or_timestamp_changes(self):
 		frappe.db.delete("Bin", {"item_code": self.item.name})
