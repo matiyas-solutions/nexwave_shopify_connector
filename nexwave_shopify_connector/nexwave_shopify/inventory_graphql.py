@@ -305,10 +305,26 @@ def set_inventory_batch(
 
 	response = execute_graphql(mutation, variables)
 
-	data = (response or {}).get("data") or {}
-	payload = data.get("inventorySetQuantities") or {}
-	user_errors = payload.get("userErrors") or []
-	throttle = ThrottleStatus.from_extensions((response or {}).get("extensions"))
+	if not isinstance(response, dict) or not isinstance(response.get("data"), dict):
+		raise ShopifyGraphQLError(
+			"Malformed inventorySetQuantities response: missing data object", http_status=-1
+		)
+	payload = response["data"].get("inventorySetQuantities")
+	if not isinstance(payload, dict):
+		raise ShopifyGraphQLError(
+			"Malformed inventorySetQuantities response: missing mutation payload", http_status=-1
+		)
+	user_errors = payload.get("userErrors")
+	if not isinstance(user_errors, list):
+		raise ShopifyGraphQLError(
+			"Malformed inventorySetQuantities response: missing userErrors array", http_status=-1
+		)
+	adjustment_group = payload.get("inventoryAdjustmentGroup")
+	if adjustment_group is not None and not isinstance(adjustment_group, dict):
+		raise ShopifyGraphQLError(
+			"Malformed inventorySetQuantities response: invalid adjustment group", http_status=-1
+		)
+	throttle = ThrottleStatus.from_extensions(response.get("extensions"))
 
 	# Map userErrors back to source rows. A userError path looks like
 	# ["input", "quantities", <index>, <field>]. A global error (e.g.
@@ -316,10 +332,21 @@ def set_inventory_batch(
 	failed_indexes: dict[int, list[str]] = {}
 	global_errors: list[str] = []
 	for err in user_errors:
-		if not isinstance(err, dict):
-			continue
+		if (
+			not isinstance(err, dict)
+			or not isinstance(err.get("message"), str)
+			or not err["message"].strip()
+			or (err.get("field") is not None and not isinstance(err["field"], list))
+			or (
+				isinstance(err.get("field"), list) and any(not isinstance(part, str) for part in err["field"])
+			)
+			or (err.get("code") is not None and not isinstance(err["code"], str))
+		):
+			raise ShopifyGraphQLError(
+				"Malformed inventorySetQuantities response: invalid userError", http_status=-1
+			)
 		field_path = err.get("field") or []
-		message = err.get("message") or "Unknown error"
+		message = err["message"]
 		code = err.get("code")
 		full_msg = f"{code}: {message}" if code else message
 
@@ -346,7 +373,14 @@ def set_inventory_batch(
 	succeeded: list[str] = []
 	failed: list[tuple[str, str]] = []
 
-	if global_errors:
+	if adjustment_group is None:
+		# A null group does not acknowledge any stock writes. Keep useful
+		# per-row errors, but do not infer success for the unaffected rows.
+		for idx, q in enumerate(quantities):
+			errors = [*global_errors, *failed_indexes.get(idx, [])]
+			errors.append("Shopify did not acknowledge an inventory adjustment group")
+			failed.append((q["item_code"], "; ".join(errors)))
+	elif global_errors:
 		# Whole batch failed
 		combined = "; ".join(global_errors)
 		for q in quantities:

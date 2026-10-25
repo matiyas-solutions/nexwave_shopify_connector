@@ -13,6 +13,7 @@
   "shopify_inventory_item_id",
   "shopify_sku",
   "column_break_2",
+  "inventory_sync_pending",
   "last_sync_at",
   "last_sync_hash",
   "last_image_hash"
@@ -69,6 +70,14 @@
    "fieldtype": "Column Break"
   },
   {
+   "default": "0",
+   "fieldname": "inventory_sync_pending",
+   "fieldtype": "Check",
+   "label": "Inventory Sync Pending",
+   "read_only": 1,
+   "description": "The initial stock update is pending. Scheduled inventory sync retries this link until all required stock updates succeed."
+  },
+  {
    "fieldname": "last_sync_at",
    "fieldtype": "Datetime",
    "label": "Last Sync At",
@@ -92,7 +101,7 @@
  "index_web_pages_for_search": 1,
  "istable": 1,
  "links": [],
- "modified": "2026-04-10 10:00:00.000000",
+ "modified": "2026-10-25 13:55:38.481191",
  "modified_by": "Administrator",
  "module": "NexWave Shopify",
  "name": "Item Shopify Store",

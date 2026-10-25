@@ -13,6 +13,7 @@ from shopify.collection import PaginatedIterator
 from shopify.resources import Order
 from shopify.session import Session
 
+from nexwave_shopify_connector.nexwave_shopify.auto_link import auto_link_order_items
 from nexwave_shopify_connector.nexwave_shopify.connection import DEFAULT_API_VERSION
 from nexwave_shopify_connector.nexwave_shopify.fulfillment import create_delivery_notes_from_fulfillments
 from nexwave_shopify_connector.nexwave_shopify.tax import TaxBuilder, apply_rounding_adjustment
@@ -154,7 +155,21 @@ def _process_order(order: dict, store, request_id: str | None = None) -> str | N
 					reference_name=so.name,
 				)
 
+	_auto_link_synced_order(order, store, so)
 	return so.name
+
+
+def _auto_link_synced_order(order: dict, store, sales_order) -> None:
+	"""Keep optional mapping failures separate from an already imported order."""
+	if not cint(store.get("auto_link_items_by_sku")):
+		return
+	savepoint = "shopify_order_auto_link"
+	frappe.db.savepoint(savepoint)
+	try:
+		auto_link_order_items(order, store, sales_order)
+	except Exception:
+		frappe.db.rollback(save_point=savepoint)
+		get_logger().exception("Automatic item linking failed for Sales Order %s", sales_order.name)
 
 
 # =============================================================================
@@ -383,6 +398,7 @@ def process_paid_order(payload: dict, request_id: str | None = None, shopify_sto
 		elif so.per_billed:
 			logger.info("[orders/paid] SO %s already billed (%s%%), skipping invoice", so.name, so.per_billed)
 
+		_auto_link_synced_order(order, store, so)
 		logger.info("[orders/paid] Successfully processed paid order %s -> SO %s", order["id"], so.name)
 
 		create_shopify_log(
