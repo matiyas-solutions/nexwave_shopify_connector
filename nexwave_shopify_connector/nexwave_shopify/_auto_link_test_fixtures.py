@@ -7,17 +7,20 @@ import frappe
 from frappe.utils import nowdate
 
 from nexwave_shopify_connector.nexwave_shopify._inventory_test_fixtures import (
+	_get_default_warehouse,
 	ensure_test_item,
 	ensure_test_shopify_store,
 )
 
 
 def make_store(**overrides):
-	return ensure_test_shopify_store(
-		shop_domain="_test-auto-link-" + frappe.generate_hash(length=10) + ".myshopify.com",
-		auto_link_items_by_sku=1,
+	values = {
+		"shop_domain": "_test-auto-link-" + frappe.generate_hash(length=10) + ".myshopify.com",
+		"auto_link_items_by_sku": 1,
+		"warehouse": _get_default_warehouse(),
 		**overrides,
-	)
+	}
+	return ensure_test_shopify_store(**values)
 
 
 def make_item(**overrides):
