@@ -109,8 +109,10 @@ class TestPendingInventorySync(FrappeTestCase):
 		self.store.reload()
 
 	def _add_second_location(self):
-		# Reload password placeholders before saving the fixture store.
+		# The fixture token lives in __Auth; repopulate the Password field so
+		# saving warehouse mappings does not remove that synthetic token.
 		self.store.reload()
+		self.store.access_token = self.store.get_password("access_token")
 		self.store.append(
 			"warehouse_mapping",
 			{"shopify_location_id": "pending-location-2", "erpnext_warehouse": self.warehouse},
