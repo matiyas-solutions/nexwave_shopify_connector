@@ -17,6 +17,10 @@ Webhook-based order ingestion with HMAC validation. Orders are automatically rou
 ### Fulfillment Sync
 Listens to Shopify fulfillment webhooks and automatically creates Delivery Notes with tracking information. Handles partial fulfillments and prevents duplicates.
 
+Uses standard ERPNext Delivery Notes by default. Other apps can register a generic [fulfillment adapter](docs/developer-guide.md#fulfillment-adapters) to supply delivery items for their own workflows. The connector owns submission, shipping, duplicate prevention and transaction rollback.
+
+New order imports retain Shopify line IDs for exact source-row resolution. Run the normal site migration when upgrading to add the hidden line-ID field.
+
 ### Product and Inventory Push
 Sync items from ERPNext to Shopify with configurable field mapping (standard fields and metafields). Push stock levels from ERPNext warehouses to Shopify locations with multi-location support.
 

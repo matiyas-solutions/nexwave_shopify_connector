@@ -5,6 +5,7 @@ import frappe
 from frappe import _
 from frappe.utils import cstr, flt
 
+from nexwave_shopify_connector.nexwave_shopify.fulfillment_adapter import get_fulfillment_adapter
 from nexwave_shopify_connector.nexwave_shopify.utils import create_shopify_log
 from nexwave_shopify_connector.utils.logger import get_logger
 
@@ -96,6 +97,20 @@ def sync_fulfillment(payload: dict, request_id: str | None = None, shopify_store
 
 
 def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
+	"""Create fulfillment deliveries atomically, leaving failed calls retryable."""
+	savepoint = "shopify_fulfillment_" + frappe.generate_hash(length=10)
+	frappe.db.savepoint(savepoint)
+	try:
+		return _create_delivery_notes_from_fulfillments(order, store)
+	except (frappe.QueryDeadlockError, frappe.QueryTimeoutError):
+		frappe.db.rollback()
+		raise
+	except Exception:
+		frappe.db.rollback(save_point=savepoint)
+		raise
+
+
+def _create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	"""
 	Create Delivery Notes from Shopify order fulfillments.
 
@@ -112,7 +127,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	# Find the Sales Order
 	so_name = frappe.db.get_value(
 		"Sales Order",
-		{"shopify_order_id": shopify_order_id, "docstatus": 1},
+		{"shopify_order_id": shopify_order_id, "shopify_store": store.name, "docstatus": 1},
 		"name",
 	)
 
@@ -120,7 +135,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 		# Check if SO exists but is not submitted
 		draft_so = frappe.db.get_value(
 			"Sales Order",
-			{"shopify_order_id": shopify_order_id, "docstatus": 0},
+			{"shopify_order_id": shopify_order_id, "shopify_store": store.name, "docstatus": 0},
 			"name",
 		)
 		if draft_so:
@@ -149,6 +164,18 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 		}
 
 	so = frappe.get_doc("Sales Order", so_name)
+	adapter = get_fulfillment_adapter()
+
+	warehouses = {
+		_get_warehouse_for_location(store, cstr(value.get("location_id") or "")) or store.warehouse
+		for value in order.get("fulfillments", [])
+	}
+	if adapter is not None:
+		adapter.prepare_sources(so, order, store, warehouses - {None, ""})
+	# Providers prepare source locks before order locking and retry deduplication.
+	so = frappe.get_doc("Sales Order", so_name, for_update=True)
+	if so.docstatus != 1 or so.shopify_store != store.name or so.shopify_order_id != shopify_order_id:
+		frappe.throw(_("The Shopify Sales Order changed while fulfillment was waiting. Retry the event."))
 
 	fulfillments = order.get("fulfillments", [])
 	if not fulfillments:
@@ -183,6 +210,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	failed_count = 0
 
 	for fulfillment in fulfillments:
+		so.reload()
 		fulfillment_id = cstr(fulfillment.get("id"))
 
 		# Check if DN already exists for this fulfillment (deduplication, store-scoped)
@@ -190,6 +218,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 			"Delivery Note",
 			{"shopify_fulfillment_id": fulfillment_id, "shopify_store": store.name},
 			"name",
+			for_update=True,
 		)
 
 		if existing_dn:
@@ -217,6 +246,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 			store=store,
 			shopify_order_id=shopify_order_id,
 			order=order,
+			adapter=adapter,
 		)
 
 		if dn_name:
@@ -252,6 +282,7 @@ def _create_delivery_note_from_fulfillment(
 	store,
 	shopify_order_id: str,
 	order: dict,
+	adapter=None,
 ) -> str | None:
 	"""
 	Create a single Delivery Note from a Shopify fulfillment.
@@ -315,13 +346,26 @@ def _create_delivery_note_from_fulfillment(
 		len(line_items),
 		len(so.items),
 	)
-	dn_items = _get_fulfillment_items(
-		so_items=so.items,
-		fulfillment_items=line_items,
-		warehouse=warehouse,
-		store=store,
-		so_name=so.name,
+	dn_items = (
+		adapter.get_delivery_items(so, line_items, warehouse or store.warehouse, store)
+		if adapter is not None
+		else None
 	)
+	if dn_items is not None and (
+		not isinstance(dn_items, list) or any(not isinstance(item, dict) for item in dn_items)
+	):
+		frappe.throw(_("The Shopify fulfillment adapter must return None or a list of item dictionaries."))
+	if dn_items is None:
+		dn_items = _get_fulfillment_items(
+			so_items=so.items,
+			fulfillment_items=line_items,
+			warehouse=warehouse,
+			store=store,
+			so_name=so.name,
+		)
+	else:
+		# Providers may reuse their rows across fulfillments; shipping is local.
+		dn_items = [dict(item) for item in dn_items]
 
 	# Add shipping items if configured
 	if store.add_shipping_as_item and store.shipping_item:
@@ -332,6 +376,8 @@ def _create_delivery_note_from_fulfillment(
 
 		for so_item in so.items:
 			if so_item.item_code == store.shipping_item:
+				if any(item.get("so_detail") == so_item.name for item in dn_items):
+					continue
 				qty = so_item.qty
 
 				# Check remaining qty if setting is enabled
@@ -465,7 +511,9 @@ def _get_fulfillment_items(
 
 			# Older imports lack line IDs. Allocate those rows in order, without
 			# borrowing the price or capacity of a row with a different known ID.
-			candidates = [row for row in so_items_by_sku[sku] if not row.get("shopify_line_item_id")]
+			candidates = [
+				row for row in so_items_by_sku[sku] if not cstr(row.get("shopify_line_item_id")).strip()
+			]
 			if not candidates:
 				raise ValueError(
 					f"Shopify fulfillment line '{line_id or '(missing ID)'}' does not match "
@@ -580,12 +628,12 @@ def _has_existing_delivery_notes(so_name: str) -> bool:
 	Returns:
 		True if at least one DN exists
 	"""
-	return frappe.db.exists(
-		"Delivery Note Item",
-		{
-			"against_sales_order": so_name,
-			"docstatus": ["in", [0, 1]],
-		},
+	return bool(
+		frappe.db.sql(
+			"SELECT name FROM `tabDelivery Note Item` "
+			"WHERE against_sales_order=%s AND docstatus IN (0, 1) FOR UPDATE",
+			(so_name,),
+		)
 	)
 
 
@@ -601,13 +649,11 @@ def _get_delivered_qty_map(so_name: str) -> dict[str, float]:
 	Returns:
 		Dict mapping so_detail (SO Item name) → total delivered qty
 	"""
-	delivered_items = frappe.get_all(
-		"Delivery Note Item",
-		filters={
-			"against_sales_order": so_name,
-			"docstatus": 1,
-		},
-		fields=["so_detail", "qty"],
+	delivered_items = frappe.db.sql(
+		"SELECT so_detail, qty FROM `tabDelivery Note Item` "
+		"WHERE against_sales_order=%s AND docstatus=1 FOR UPDATE",
+		(so_name,),
+		as_dict=True,
 	)
 
 	delivered_qty_map = {}

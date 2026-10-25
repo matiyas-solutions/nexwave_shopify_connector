@@ -23,7 +23,7 @@ Technical reference for developers working on or integrating with the NexWave Sh
 | **Item** | `shopify_stores` (table) |
 | **Customer** | `shopify_customer_id` |
 | **Sales Order** | `shopify_store`, `shopify_order_id`, `shopify_order_number`, `shopify_financial_status`, `shopify_fulfillment_status` |
-| **Sales Order Item** | `shopify_item_discount` |
+| **Sales Order Item** | `shopify_item_discount`, `shopify_line_item_id` |
 | **Delivery Note** | `shopify_store`, `shopify_order_id`, `shopify_order_number` |
 | **Sales Invoice** | `shopify_store`, `shopify_order_id`, `shopify_order_number` |
 
@@ -68,6 +68,34 @@ nexwave_shopify_connector/
 └── fixtures/
     └── custom_field.json  # Custom fields for Item, Customer, SO, DN, SI
 ```
+
+## Fulfillment adapters
+
+The connector works with standard ERPNext without any fulfillment provider. An app that manages its own delivery workflow can register one adapter class in its Frappe `hooks.py`:
+
+```python
+shopify_fulfillment_adapter = "my_app.fulfillment.DeliveryAdapter"
+```
+
+```python
+class DeliveryAdapter:
+    def prepare_sources(self, sales_order, order, store, warehouses):
+        # Acquire all workflow source locks here, before the Sales Order lock.
+        pass
+
+    def get_delivery_items(self, sales_order, line_items, warehouse, store):
+        # Return None to use the connector's ordinary ERPNext item mapping.
+        # Otherwise return a list of Delivery Note Item dictionaries.
+        return None
+```
+
+One instance serves the entire fulfillment operation. `prepare_sources` runs once before the connector locks and refreshes the submitted Sales Order. `get_delivery_items` receives that refreshed order for each successful fulfillment that has not already been processed. `order` and `line_items` contain the Shopify payload, `store` is its Shopify Store document, and `warehouses` is the set resolved from the payload's location mappings.
+
+Only `None` requests default item mapping. An empty list supplies no product rows; the connector's configured shipping augmentation still applies. The connector copies returned rows before augmentation, so an adapter can reuse its own item list across fulfillments. A provider error or invalid return value rolls back the operation, including deliveries created for earlier fulfillments in the same payload. Multiple configured providers fail before any provider is invoked.
+
+The connector owns fulfillment deduplication, the Sales Order lock, shipping augmentation, Delivery Note submission and the transaction. Adapters must not commit, roll back, submit deliveries, or perform external side effects. They must acquire the complete source-lock scope during preparation and reject source changes that would require more locks after the Sales Order is locked. Workflow-specific rules and integration tests belong to the providing app.
+
+Adapters can call `resolve_fulfillment_demands(sales_order, line_items, store)` from `nexwave_shopify_connector.nexwave_shopify.fulfillment_adapter` to resolve exact Shopify line IDs, aggregate repeated requests and apply the store's remaining-quantity setting. The result maps Sales Order Item names to `(source_row, sales_quantity)` pairs. Older imports can match one unambiguous item without a stored line ID; ambiguous or mismatched identities fail explicitly. The module exposes `FULFILLMENT_ADAPTER_API_VERSION = 1` for capability checks.
 
 ## Installation
 

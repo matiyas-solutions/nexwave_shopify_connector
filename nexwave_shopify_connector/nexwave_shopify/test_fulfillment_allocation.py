@@ -2,8 +2,12 @@
 # For license information, please see license.txt
 
 import frappe
-from frappe.tests.utils import FrappeTestCase, change_settings
+from frappe.tests.utils import FrappeTestCase, change_settings, patch_hooks
 
+from nexwave_shopify_connector.nexwave_shopify._fulfillment_adapter_test_fixtures import (
+	RecordingAdapter,
+	make_shipping_service,
+)
 from nexwave_shopify_connector.nexwave_shopify._fulfillment_test_fixtures import (
 	TEST_ITEM,
 	TEST_WAREHOUSE,
@@ -39,6 +43,10 @@ class TestFulfillmentAllocation(FrappeTestCase):
 		return [frappe.get_doc("Delivery Note", name) for name in result["created"]]
 
 	def assert_allocations(self, dn, so, quantities):
+		self.assertEqual(
+			{row.so_detail for row in dn.items},
+			{row.name for row, qty in zip(so.items, quantities, strict=True) if qty},
+		)
 		for row, qty in zip(so.items, quantities, strict=True):
 			matches = [item for item in dn.items if item.so_detail == row.name]
 			self.assertEqual(sum(item.qty for item in matches), qty)
@@ -262,3 +270,134 @@ class TestFulfillmentAllocation(FrappeTestCase):
 		so = create_fulfillment_test_order()
 		items = self.get_items(so, [{"variant_id": TEST_ITEM, "quantity": 1}])
 		self.assertEqual(items[0]["so_detail"], so.items[0].name)
+
+	def test_declining_adapter_preserves_repeated_rows_across_fulfillments(self):
+		"""A provider returning None retains ordinary exact-ID and legacy allocation."""
+		for exact in (False, True):
+			with self.subTest(exact=exact):
+				so = create_fulfillment_test_order(
+					[
+						{"qty": 2, "rate": 100, "shopify_line_item_id": "101" if exact else None},
+						{"qty": 3, "rate": 75, "shopify_line_item_id": "102" if exact else None},
+					]
+				)
+				RecordingAdapter.instances.clear()
+				with patch_hooks(
+					{
+						"shopify_fulfillment_adapter": [
+							"nexwave_shopify_connector.nexwave_shopify._fulfillment_adapter_test_fixtures.RecordingAdapter"
+						]
+					}
+				):
+					dns = self.process(
+						so,
+						[{"id": 102, "sku": TEST_ITEM, "quantity": 3}],
+						[{"id": 101, "sku": TEST_ITEM, "quantity": 2}],
+					)
+				self.assertEqual(len(RecordingAdapter.instances), 1)
+				self.assertEqual(len(RecordingAdapter.instances[0].calls), 3)
+				self.assert_allocations(dns[0], so, [0, 3] if exact else [2, 1])
+				self.assert_allocations(dns[1], so, [2, 0] if exact else [0, 2])
+				so.reload()
+				self.assertEqual([row.delivered_qty for row in so.items], [2, 3])
+		RecordingAdapter.instances.clear()
+
+	def test_later_identity_error_rolls_back_deliveries_and_allows_retry(self):
+		"""A bad second fulfillment rolls back the first submitted DN and order state."""
+		self.store.auto_fulfill_remaining_qty = 1
+		so = create_fulfillment_test_order(
+			[
+				{"qty": 2, "rate": 100, "shopify_line_item_id": "101"},
+				{"qty": 3, "rate": 75, "shopify_line_item_id": "102"},
+			]
+		)
+		payload = fulfillment_payload(
+			so,
+			[{"id": 102, "sku": TEST_ITEM, "quantity": 3}],
+			[{"id": 999, "sku": TEST_ITEM, "quantity": 2}],
+		)
+		original_status = so.status
+		with self.assertRaisesRegex(ValueError, "line.*match"):
+			create_delivery_notes_from_fulfillments(payload, self.store)
+		self.assertFalse(frappe.db.exists("Delivery Note", {"shopify_order_id": so.shopify_order_id}))
+		so.reload()
+		self.assertEqual([row.delivered_qty for row in so.items], [0, 0])
+		self.assertEqual(so.status, original_status)
+		payload["fulfillments"][1]["line_items"][0]["id"] = 101
+		result = create_delivery_notes_from_fulfillments(payload, self.store)
+		self.assertEqual(len(result["created"]), 2)
+		so.reload()
+		self.assertEqual([row.delivered_qty for row in so.items], [2, 3])
+		self.assertEqual(create_delivery_notes_from_fulfillments(payload, self.store)["skipped"], 2)
+
+	def test_shipping_payload_row_is_not_added_twice(self):
+		"""Explicit shipping retains its source row once alongside repeated products."""
+		service = make_shipping_service()
+		self.store.add_shipping_as_item = 1
+		self.store.shipping_item = service.name
+		so = create_fulfillment_test_order(
+			[
+				{"qty": 2, "rate": 100, "shopify_line_item_id": "101"},
+				{"qty": 3, "rate": 75, "shopify_line_item_id": "102"},
+				{"item_code": service.name, "qty": 1, "rate": 5, "shopify_line_item_id": "103"},
+			]
+		)
+		dn = self.process(
+			so,
+			[
+				{"id": 102, "sku": TEST_ITEM, "quantity": 3},
+				{"id": 101, "sku": TEST_ITEM, "quantity": 2},
+				{"id": 103, "sku": service.name, "quantity": 1},
+			],
+		)[0]
+		self.assert_allocations(dn, so, [2, 3, 1])
+		self.assertEqual(len(dn.items), 3)
+		self.assertEqual(dn.total, 430)
+
+	def test_shipping_is_delivered_once_across_partial_fulfillments(self):
+		"""Remaining mode avoids charging shipping again on later partial deliveries."""
+		self.store.auto_fulfill_remaining_qty = 1
+		service = make_shipping_service()
+		self.store.add_shipping_as_item = 1
+		self.store.shipping_item = service.name
+		so = create_fulfillment_test_order(
+			[
+				{"qty": 2, "rate": 100, "shopify_line_item_id": "101"},
+				{"qty": 3, "rate": 75, "shopify_line_item_id": "102"},
+				{"item_code": service.name, "qty": 1, "rate": 5},
+			]
+		)
+		dns = self.process(so, [{"id": 102, "sku": TEST_ITEM, "quantity": 1}])
+		dns += self.process(
+			so,
+			[{"id": 101, "sku": TEST_ITEM, "quantity": 2}, {"id": 102, "sku": TEST_ITEM, "quantity": 2}],
+		)
+		self.assert_allocations(dns[0], so, [0, 1, 1])
+		self.assert_allocations(dns[1], so, [2, 2, 0])
+		self.assertEqual(sum(row.qty for dn in dns for row in dn.items if row.item_code == service.name), 1)
+
+	def test_exact_repeated_requests_share_remaining_commercial_row_quantity(self):
+		"""Repeated requests use their priced row's balance after an earlier shipment."""
+		self.store.auto_fulfill_remaining_qty = 1
+		so = create_fulfillment_test_order(
+			[
+				{"qty": 2, "rate": 100, "shopify_line_item_id": "101"},
+				{"qty": 3, "rate": 75, "shopify_line_item_id": "102"},
+			]
+		)
+		self.process(so, [{"id": 102, "sku": TEST_ITEM, "quantity": 1}])
+		dn = self.process(
+			so,
+			[{"id": 102, "sku": TEST_ITEM, "quantity": 1}, {"id": 102, "sku": TEST_ITEM, "quantity": 5}],
+		)[0]
+		self.assert_allocations(dn, so, [0, 2])
+		self.assertEqual(dn.total, 150)
+		so.reload()
+		self.assertEqual([row.delivered_qty for row in so.items], [0, 3])
+
+	def test_whitespace_line_ids_remain_eligible_for_legacy_fallback(self):
+		"""Whitespace-only stored identities behave consistently as missing IDs."""
+		so = create_fulfillment_test_order()
+		frappe.db.set_value("Sales Order Item", so.items[0].name, "shopify_line_item_id", " \t ")
+		dn = self.process(so, [{"sku": TEST_ITEM, "quantity": 5}])[0]
+		self.assert_allocations(dn, so, [2, 3])
