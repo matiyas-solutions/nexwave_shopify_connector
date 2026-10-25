@@ -30,6 +30,7 @@
   "item_group",
   "section_break_orders",
   "sync_orders",
+  "auto_link_items_by_sku",
   "sync_all_order_statuses",
   "sales_order_series",
   "delivery_note_series",
@@ -234,6 +235,13 @@
    "fieldname": "sync_orders",
    "fieldtype": "Check",
    "label": "Sync Orders"
+  },
+  {
+   "default": "0",
+   "fieldname": "auto_link_items_by_sku",
+   "fieldtype": "Check",
+   "label": "Auto-link Items from Orders by SKU",
+   "description": "Link existing items when incoming order SKUs match item codes. When inventory sync is enabled, newly linked stock items receive an immediate inventory update."
   },
   {
    "default": "0",
@@ -554,7 +562,7 @@
    "link_fieldname": "shopify_store"
   }
  ],
- "modified": "2026-06-18 00:00:00.000000",
+ "modified": "2026-10-25 13:55:38.479810",
  "modified_by": "Administrator",
  "module": "NexWave Shopify",
  "name": "Shopify Store",
