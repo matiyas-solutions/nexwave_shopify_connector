@@ -1,3 +1,11 @@
+## [15.1.7](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.6...v15.1.7) (2026-10-25)
+
+
+### Bug Fixes
+
+* **fulfillment:** preserve repeated-SKU order row links ([86832b9](https://github.com/one-highflyer/nexwave_shopify_connector/commit/86832b98cdff666e5aa2cbde22328aef8d1cdb97))
+* **fulfillment:** reconcile ordinary dispatch allocation with version-15 ([d56ccce](https://github.com/one-highflyer/nexwave_shopify_connector/commit/d56cccefa07915727399b005a12652ddba2e61e0))
+
 ## [15.1.6](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.5...v15.1.6) (2026-10-24)
 
 
