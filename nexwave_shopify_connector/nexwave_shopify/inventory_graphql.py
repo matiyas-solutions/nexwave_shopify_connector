@@ -319,7 +319,11 @@ def set_inventory_batch(
 		raise ShopifyGraphQLError(
 			"Malformed inventorySetQuantities response: missing userErrors array", http_status=-1
 		)
-	adjustment_group = payload.get("inventoryAdjustmentGroup")
+	if "inventoryAdjustmentGroup" not in payload:
+		raise ShopifyGraphQLError(
+			"Malformed inventorySetQuantities response: missing adjustment group", http_status=-1
+		)
+	adjustment_group = payload["inventoryAdjustmentGroup"]
 	if adjustment_group is not None and not isinstance(adjustment_group, dict):
 		raise ShopifyGraphQLError(
 			"Malformed inventorySetQuantities response: invalid adjustment group", http_status=-1
@@ -373,9 +377,9 @@ def set_inventory_batch(
 	succeeded: list[str] = []
 	failed: list[tuple[str, str]] = []
 
-	if adjustment_group is None:
-		# A null group does not acknowledge any stock writes. Keep useful
-		# per-row errors, but do not infer success for the unaffected rows.
+	if adjustment_group is None and user_errors:
+		# A null group with errors does not acknowledge any stock writes.
+		# Keep useful per-row errors without assuming other rows succeeded.
 		for idx, q in enumerate(quantities):
 			errors = [*global_errors, *failed_indexes.get(idx, [])]
 			errors.append("Shopify did not acknowledge an inventory adjustment group")
@@ -386,6 +390,8 @@ def set_inventory_batch(
 		for q in quantities:
 			failed.append((q["item_code"], combined))
 	else:
+		# Shopify can return an explicit null group for unchanged quantities.
+		# A complete response with no errors still accepts the operation.
 		for idx, q in enumerate(quantities):
 			if idx in failed_indexes:
 				failed.append((q["item_code"], "; ".join(failed_indexes[idx])))
