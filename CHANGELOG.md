@@ -1,3 +1,10 @@
+## [15.2.1](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.2.0...v15.2.1) (2026-10-26)
+
+
+### Bug Fixes
+
+* **inventory:** accept successful unchanged quantity updates ([d6133c6](https://github.com/one-highflyer/nexwave_shopify_connector/commit/d6133c6cdfe8130fc5d9422880b647c501f64d3f))
+
 # [15.2.0](https://github.com/one-highflyer/nexwave_shopify_connector/compare/v15.1.7...v15.2.0) (2026-10-25)
 
 
