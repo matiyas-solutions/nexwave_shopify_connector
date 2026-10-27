@@ -21,6 +21,12 @@ from nexwave_shopify_connector.nexwave_shopify.inventory_graphql import (
 	set_inventory_batch,
 )
 
+_ADJUSTMENT_GROUP = {
+	"createdAt": "2026-04-10T10:00:00Z",
+	"reason": "correction",
+	"changes": [],
+}
+
 
 class TestThrottleStatus(FrappeTestCase):
 	def test_from_full_extensions(self):
@@ -87,7 +93,7 @@ class TestSetInventoryBatch(FrappeTestCase):
 		mock_exec.return_value = {
 			"data": {
 				"inventorySetQuantities": {
-					"inventoryAdjustmentGroup": None,
+					"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP,
 					"userErrors": [
 						{
 							"field": ["input", "quantities", "1", "quantity"],
@@ -119,6 +125,166 @@ class TestSetInventoryBatch(FrappeTestCase):
 		self.assertIn("Inventory item not found", result.failed[0][1])
 
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_missing_or_malformed_mutation_payload_does_not_succeed(self, mock_exec):
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		for response in (
+			None,
+			[],
+			"invalid",
+			{},
+			{"data": None},
+			{"data": []},
+			{"data": {}},
+			{"data": {"inventorySetQuantities": None}},
+			{"data": {"inventorySetQuantities": []}},
+			{"data": {"inventorySetQuantities": "invalid"}},
+		):
+			with self.subTest(response=response):
+				mock_exec.return_value = response
+				with self.assertRaises(ShopifyGraphQLError) as ctx:
+					set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+				self.assertEqual(ctx.exception.http_status, -1)
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_missing_or_malformed_user_errors_does_not_succeed(self, mock_exec):
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		for error_values in (
+			{},
+			{"userErrors": None},
+			{"userErrors": {}},
+			{"userErrors": "invalid"},
+			{"userErrors": [None]},
+			{"userErrors": ["invalid"]},
+			{"userErrors": [{}]},
+			{"userErrors": [{"message": ""}]},
+			{"userErrors": [{"message": 123}]},
+			{"userErrors": [{"message": "Error", "field": "input"}]},
+			{"userErrors": [{"message": "Error", "field": ["input", "quantities", 1.5]}]},
+			{"userErrors": [{"message": "Error", "code": []}]},
+		):
+			with self.subTest(error_values=error_values):
+				mock_exec.return_value = {
+					"data": {
+						"inventorySetQuantities": {
+							"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP,
+							**error_values,
+						}
+					}
+				}
+				with self.assertRaises(ShopifyGraphQLError) as ctx:
+					set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+				self.assertEqual(ctx.exception.http_status, -1)
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_missing_adjustment_group_does_not_succeed(self, mock_exec):
+		quantities = [
+			{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5},
+			{"item_code": "ITEM-B", "inventory_item_id": "1002", "location_id": "loc1", "qty": 0},
+		]
+		mock_exec.return_value = {"data": {"inventorySetQuantities": {"userErrors": []}}}
+		with self.assertRaises(ShopifyGraphQLError) as ctx:
+			set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+		self.assertEqual(ctx.exception.http_status, -1)
+		self.assertIn("missing adjustment group", str(ctx.exception))
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_null_adjustment_group_without_errors_accepts_unchanged_quantities(self, mock_exec):
+		response = {
+			"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}},
+			"extensions": {
+				"cost": {
+					"throttleStatus": {
+						"currentlyAvailable": 990,
+						"maximumAvailable": 1000,
+						"restoreRate": 50.0,
+					}
+				}
+			},
+		}
+		mock_exec.return_value = response
+		quantities = [
+			{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5},
+			{"item_code": "ITEM-B", "inventory_item_id": "1002", "location_id": "loc1", "qty": 0},
+			{"item_code": "ITEM-A", "inventory_item_id": "1003", "location_id": "loc1", "qty": 5},
+		]
+		for api_version in (None, "2026-01", "2026-04"):
+			with self.subTest(api_version=api_version):
+				result = set_inventory_batch(
+					quantities,
+					"test.myshopify.com",
+					"2026-04-10T10:00:00",
+					api_version=api_version,
+					idempotency_key="test-unchanged-quantities",
+				)
+				self.assertEqual(result.succeeded, ["ITEM-A", "ITEM-B", "ITEM-A"])
+				self.assertEqual(result.failed, [])
+				self.assertEqual(result.throttle.currently_available, 990)
+				self.assertIs(result.raw_response, response)
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_null_adjustment_group_requires_valid_user_errors(self, mock_exec):
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		for error_values in (
+			{},
+			{"userErrors": None},
+			{"userErrors": {}},
+			{"userErrors": False},
+			{"userErrors": "invalid"},
+			{"userErrors": [None]},
+			{"userErrors": [{}]},
+		):
+			with self.subTest(error_values=error_values):
+				mock_exec.return_value = {
+					"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, **error_values}}
+				}
+				with self.assertRaises(ShopifyGraphQLError) as ctx:
+					set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+				self.assertEqual(ctx.exception.http_status, -1)
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_null_adjustment_group_keeps_errors_and_fails_unacknowledged_rows(self, mock_exec):
+		mock_exec.return_value = {
+			"data": {
+				"inventorySetQuantities": {
+					"inventoryAdjustmentGroup": None,
+					"userErrors": [
+						{
+							"field": ["input", "quantities", "1", "quantity"],
+							"message": "Inventory item not found",
+							"code": "INVENTORY_ITEM_NOT_FOUND",
+						}
+					],
+				}
+			}
+		}
+		quantities = [
+			{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5},
+			{"item_code": "ITEM-B", "inventory_item_id": "1002", "location_id": "loc1", "qty": 0},
+		]
+		result = set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+		self.assertEqual(result.succeeded, [])
+		self.assertEqual(len(result.failed), 2)
+		self.assertIn("did not acknowledge", result.failed[0][1])
+		self.assertIn("INVENTORY_ITEM_NOT_FOUND: Inventory item not found", result.failed[1][1])
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
+	def test_malformed_adjustment_group_does_not_succeed(self, mock_exec):
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		for adjustment_group in ([], "invalid", False, 1):
+			with self.subTest(adjustment_group=adjustment_group):
+				mock_exec.return_value = {
+					"data": {
+						"inventorySetQuantities": {
+							"inventoryAdjustmentGroup": adjustment_group,
+							"userErrors": [],
+						}
+					}
+				}
+				with self.assertRaises(ShopifyGraphQLError) as ctx:
+					set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+				self.assertEqual(ctx.exception.http_status, -1)
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
 	def test_global_user_error_fails_whole_batch(self, mock_exec):
 		mock_exec.return_value = {
 			"data": {
@@ -146,7 +312,9 @@ class TestSetInventoryBatch(FrappeTestCase):
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
 	def test_reference_document_uri_includes_store(self, mock_exec):
 		mock_exec.return_value = {
-			"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}},
+			"data": {
+				"inventorySetQuantities": {"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP, "userErrors": []}
+			},
 			"extensions": {"cost": {"throttleStatus": {"currentlyAvailable": 900}}},
 		}
 		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
@@ -157,7 +325,9 @@ class TestSetInventoryBatch(FrappeTestCase):
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
 	def test_quantities_formatted_as_gids(self, mock_exec):
 		mock_exec.return_value = {
-			"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}},
+			"data": {
+				"inventorySetQuantities": {"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP, "userErrors": []}
+			},
 			"extensions": {"cost": {"throttleStatus": {"currentlyAvailable": 900}}},
 		}
 		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
@@ -179,7 +349,9 @@ class TestSetInventoryBatch(FrappeTestCase):
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
 	def test_2024_01_uses_legacy_mutation_shape(self, mock_exec):
 		mock_exec.return_value = {
-			"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}}
+			"data": {
+				"inventorySetQuantities": {"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP, "userErrors": []}
+			}
 		}
 		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
 
@@ -200,7 +372,9 @@ class TestSetInventoryBatch(FrappeTestCase):
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.execute_graphql")
 	def test_2026_01_and_later_use_idempotent_mutation_shape(self, mock_exec):
 		mock_exec.return_value = {
-			"data": {"inventorySetQuantities": {"inventoryAdjustmentGroup": None, "userErrors": []}}
+			"data": {
+				"inventorySetQuantities": {"inventoryAdjustmentGroup": _ADJUSTMENT_GROUP, "userErrors": []}
+			}
 		}
 		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
 
@@ -393,6 +567,31 @@ class TestFetchInventoryItemIds(FrappeTestCase):
 
 
 class TestExecuteGraphql(FrappeTestCase):
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.shopify")
+	def test_unchanged_inventory_response_succeeds_through_sdk_boundary(self, mock_shopify):
+		client = mock_shopify.GraphQL.return_value
+		client.execute.return_value = (
+			'{"data":{"inventorySetQuantities":{"inventoryAdjustmentGroup":null,"userErrors":[]}}}'
+		)
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		result = set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+		self.assertEqual(result.succeeded, ["ITEM-A"])
+		self.assertEqual(result.failed, [])
+		client.execute.assert_called_once()
+
+	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.shopify")
+	def test_top_level_errors_reject_an_otherwise_valid_unchanged_response(self, mock_shopify):
+		client = mock_shopify.GraphQL.return_value
+		client.execute.return_value = (
+			'{"data":{"inventorySetQuantities":{"inventoryAdjustmentGroup":null,"userErrors":[]}},'
+			'"errors":[{"message":"Inventory request failed"}]}'
+		)
+		quantities = [{"item_code": "ITEM-A", "inventory_item_id": "1001", "location_id": "loc1", "qty": 5}]
+		with self.assertRaises(ShopifyGraphQLError) as ctx:
+			set_inventory_batch(quantities, "test.myshopify.com", "2026-04-10T10:00:00")
+		self.assertEqual(ctx.exception.http_status, -1)
+		self.assertIn("Inventory request failed", str(ctx.exception))
+
 	@patch("nexwave_shopify_connector.nexwave_shopify.inventory_graphql.shopify")
 	def test_returns_parsed_json(self, mock_shopify):
 		client = mock_shopify.GraphQL.return_value

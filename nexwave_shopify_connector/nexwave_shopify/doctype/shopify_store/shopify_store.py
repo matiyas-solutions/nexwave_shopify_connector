@@ -52,6 +52,7 @@ class ShopifyStore(Document):
 		auto_create_collections: DF.Check
 		auto_create_invoice: DF.Check
 		auto_create_payment_entry: DF.Check
+		auto_link_items_by_sku: DF.Check
 		auto_submit_sales_order: DF.Check
 		callback_url: DF.Data | None
 		cash_bank_account: DF.Link | None

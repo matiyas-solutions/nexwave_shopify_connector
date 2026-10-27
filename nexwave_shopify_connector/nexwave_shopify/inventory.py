@@ -5,6 +5,7 @@ import math
 import re
 import time
 import uuid
+from collections import Counter
 from typing import TYPE_CHECKING
 
 import frappe
@@ -121,6 +122,75 @@ def _include_draft_order_reservations(store) -> bool:
 	return bool(cint(store.get("reserve_stock_for_draft_orders")))
 
 
+def _clear_successful_pending_inventory_sync(
+	store_name: str,
+	snapshot_items: list[dict],
+	resolved_items: list[dict],
+	location_mapping: list[tuple[str, str]],
+	quantities_by_location: dict[str, list[dict]],
+	succeeded: Counter[str],
+	failed_item_codes: set[str],
+) -> None:
+	"""Clear snapshot pending rows only after every sibling target succeeds.
+
+	Batch results identify source items, not mapping rows. Keep every pending
+	row for an item until all its variants and locations succeeded together.
+	Conditional updates preserve mappings changed while the request was in flight.
+	"""
+	if not any(cint(item.get("inventory_sync_pending")) for item in snapshot_items):
+		return
+
+	resolved_by_row = {item["item_shopify_store_name"]: item for item in resolved_items}
+	rows_by_item: dict[str, list[dict]] = {}
+	for item in snapshot_items:
+		rows_by_item.setdefault(item["item_code"], []).append(item)
+
+	prepared_targets: dict[str, set[tuple[str, str]]] = {}
+	for location_id, quantities in quantities_by_location.items():
+		for quantity in quantities:
+			prepared_targets.setdefault(quantity["item_code"], set()).add(
+				(str(quantity["inventory_item_id"]), str(location_id))
+			)
+
+	locations = {str(location_id) for location_id, _warehouse in location_mapping}
+	for item_code, rows in rows_by_item.items():
+		pending_rows = [row for row in rows if cint(row.get("inventory_sync_pending"))]
+		if not pending_rows or item_code in failed_item_codes:
+			continue
+		if any(row["item_shopify_store_name"] not in resolved_by_row for row in rows):
+			continue
+
+		expected_targets = {
+			(str(resolved_by_row[row["item_shopify_store_name"]]["shopify_inventory_item_id"]), location_id)
+			for row in rows
+			for location_id in locations
+		}
+		if not expected_targets or prepared_targets.get(item_code) != expected_targets:
+			continue
+		if succeeded[item_code] != len(expected_targets):
+			continue
+
+		for row in pending_rows:
+			resolved_row = resolved_by_row[row["item_shopify_store_name"]]
+			filters = {
+				"name": row["item_shopify_store_name"],
+				"parent": item_code,
+				"parenttype": "Item",
+				"parentfield": "shopify_stores",
+				"shopify_store": store_name,
+				"enabled": 1,
+				"inventory_sync_pending": 1,
+				"shopify_variant_id": row["shopify_variant_id"],
+				"shopify_product_id": row.get("shopify_product_id"),
+				"shopify_inventory_item_id": resolved_row["shopify_inventory_item_id"],
+				"shopify_sku": row.get("shopify_sku"),
+				"modified": row["mapping_modified"],
+			}
+			frappe.db.set_value(
+				"Item Shopify Store", filters, "inventory_sync_pending", 0, update_modified=False
+			)
+
+
 def sync_store_inventory(store_name: str, force: bool = False):
 	"""
 	Sync inventory for all items linked to a specific store.
@@ -202,6 +272,9 @@ def sync_store_inventory(store_name: str, force: bool = False):
 	total_sync = 0
 	total_skip = 0
 	total_error = 0
+	succeeded = Counter()
+	failed_item_codes = set()
+	snapshot_items = items_to_sync
 
 	# Bulk read Bin quantities for all (item, warehouse) pairs in one shot
 	pairs = [(item["item_code"], wh) for item in items_to_sync for (_loc, wh) in location_mapping]
@@ -236,6 +309,7 @@ def sync_store_inventory(store_name: str, force: bool = False):
 				location_mapping, items_to_sync, qty_by_pair, target_owners
 			)
 			total_error += len(preparation_failures)
+			failed_item_codes.update(item_code for item_code, _error in preparation_failures)
 			_persist_inventory_failures(
 				preparation_failures,
 				method="sync_store_inventory",
@@ -265,6 +339,7 @@ def sync_store_inventory(store_name: str, force: bool = False):
 						# Future PR: emit one aggregate Error log per failed
 						# batch and a debug logger line listing the item codes.
 						total_error += len(chunk)
+						failed_item_codes.update(q["item_code"] for q in chunk)
 						for q in chunk:
 							create_shopify_log(
 								status="Error",
@@ -283,6 +358,8 @@ def sync_store_inventory(store_name: str, force: bool = False):
 
 					total_sync += len(result.succeeded)
 					total_error += len(result.failed)
+					succeeded.update(result.succeeded)
+					failed_item_codes.update(item_code for item_code, _error in result.failed)
 					_persist_inventory_failures(
 						result.failed,
 						method="sync_store_inventory",
@@ -300,6 +377,16 @@ def sync_store_inventory(store_name: str, force: bool = False):
 						result.throttle.currently_available,
 					)
 					_throttle_if_needed(result.throttle, logger)
+
+		_clear_successful_pending_inventory_sync(
+			store_name,
+			snapshot_items,
+			items_to_sync,
+			location_mapping,
+			quantities_by_location,
+			succeeded,
+			failed_item_codes,
+		)
 
 		# Only update last_inventory_sync when the run made actual progress
 		# (at least one item synced successfully). Zero-progress runs are
@@ -466,6 +553,8 @@ def sync_items_inventory(
 	method = "sync_changed_bin_inventory" if source == "changed_bins" else "sync_items_inventory"
 	t0 = time.monotonic()
 	stats = {"synced": 0, "skipped": 0, "errors": 0, "elapsed": 0}
+	succeeded = Counter()
+	failed_item_codes = set()
 	item_codes = sorted({item_code for item_code in item_codes if item_code})
 
 	if not item_codes:
@@ -553,6 +642,7 @@ def sync_items_inventory(
 				location_mapping, items_to_sync, qty_by_pair, target_owners
 			)
 			stats["errors"] += len(preparation_failures)
+			failed_item_codes.update(item_code for item_code, _error in preparation_failures)
 			_persist_inventory_failures(
 				preparation_failures,
 				method=method,
@@ -577,6 +667,7 @@ def sync_items_inventory(
 						)
 					except ShopifyGraphQLError as e:
 						stats["errors"] += len(chunk)
+						failed_item_codes.update(q["item_code"] for q in chunk)
 						for q in chunk:
 							create_shopify_log(
 								status="Error",
@@ -595,6 +686,8 @@ def sync_items_inventory(
 
 					stats["synced"] += len(result.succeeded)
 					stats["errors"] += len(result.failed)
+					succeeded.update(result.succeeded)
+					failed_item_codes.update(item_code for item_code, _error in result.failed)
 					_persist_inventory_failures(
 						result.failed,
 						method=method,
@@ -613,6 +706,16 @@ def sync_items_inventory(
 						result.throttle.currently_available,
 					)
 					_throttle_if_needed(result.throttle, logger)
+
+		_clear_successful_pending_inventory_sync(
+			store_name,
+			store_items,
+			resolved_store_items,
+			location_mapping,
+			quantities_by_location,
+			succeeded,
+			failed_item_codes,
+		)
 
 	except Exception as e:
 		logger.error(
@@ -690,8 +793,23 @@ def _get_changed_inventory_item_codes(
 		params,
 		as_dict=True,
 	)
+	pending_rows = frappe.db.sql(
+		"""
+		SELECT DISTINCT iss.parent AS item_code
+		FROM `tabItem Shopify Store` iss
+		JOIN `tabItem` item ON item.name = iss.parent
+		WHERE iss.shopify_store = %(store_name)s
+		  AND iss.enabled = 1
+		  AND iss.shopify_variant_id IS NOT NULL
+		  AND iss.shopify_variant_id != ''
+		  AND item.disabled = 0
+		  AND iss.inventory_sync_pending = 1
+		""",
+		params,
+		as_dict=True,
+	)
 
-	return sorted({row["item_code"] for row in [*bin_rows, *mapping_rows]})
+	return sorted({row["item_code"] for row in [*bin_rows, *mapping_rows, *pending_rows]})
 
 
 def _execute_batch_with_retry(
@@ -1188,7 +1306,10 @@ def get_items_with_shopify_ids(
 				iss.parent as item_code,
 				iss.shopify_product_id,
 				iss.shopify_variant_id,
-				iss.shopify_inventory_item_id
+				iss.shopify_inventory_item_id,
+				iss.shopify_sku,
+				iss.inventory_sync_pending,
+				iss.modified AS mapping_modified
 			FROM `tabItem Shopify Store` iss
 			JOIN `tabItem` item ON item.name = iss.parent
 			WHERE
@@ -1209,7 +1330,10 @@ def get_items_with_shopify_ids(
 				iss.parent as item_code,
 				iss.shopify_product_id,
 				iss.shopify_variant_id,
-				iss.shopify_inventory_item_id
+				iss.shopify_inventory_item_id,
+				iss.shopify_sku,
+				iss.inventory_sync_pending,
+				iss.modified AS mapping_modified
 			FROM `tabItem Shopify Store` iss
 			JOIN `tabItem` item ON item.name = iss.parent
 			WHERE
@@ -1402,6 +1526,8 @@ def sync_single_item_inventory(item_code: str, store_name: str | None = None):
 		)
 
 		timestamp_iso = now_datetime().isoformat()
+		succeeded = Counter()
+		failed_item_codes = set()
 
 		try:
 			with Session.temp(store.shop_domain, api_version, access_token):
@@ -1450,6 +1576,7 @@ def sync_single_item_inventory(item_code: str, store_name: str | None = None):
 				quantities_by_location, preparation_failures = _prepare_inventory_quantities(
 					location_mapping, items_payload, qty_by_pair, target_owners
 				)
+				failed_item_codes.update(item_code for item_code, _error in preparation_failures)
 				_persist_inventory_failures(
 					preparation_failures,
 					method="sync_single_item_inventory",
@@ -1469,6 +1596,7 @@ def sync_single_item_inventory(item_code: str, store_name: str | None = None):
 							api_version=api_version,
 						)
 					except ShopifyGraphQLError as e:
+						failed_item_codes.update(q["item_code"] for q in qty_entries)
 						logger.error(
 							"Single-item sync failed for %s -> %s at location %s: %s",
 							item_code,
@@ -1493,7 +1621,19 @@ def sync_single_item_inventory(item_code: str, store_name: str | None = None):
 						method="sync_single_item_inventory",
 						store_name=store.name,
 					)
+					succeeded.update(result.succeeded)
+					failed_item_codes.update(item_code for item_code, _error in result.failed)
 					_throttle_if_needed(result.throttle, logger)
+
+			_clear_successful_pending_inventory_sync(
+				store.name,
+				store_items,
+				resolved_store_items,
+				location_mapping,
+				quantities_by_location,
+				succeeded,
+				failed_item_codes,
+			)
 
 		except Exception as e:
 			logger.error(

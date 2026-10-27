@@ -58,6 +58,7 @@ def create_test_sales_order(customer, item_code, qty=10, warehouse=None, shopify
 		{
 			"doctype": "Sales Order",
 			"customer": customer,
+			"shopify_store": "_test-store.myshopify.com" if shopify_order_id else None,
 			"delivery_date": frappe.utils.add_days(frappe.utils.nowdate(), 7),
 			"items": [
 				{
@@ -90,7 +91,7 @@ def create_test_delivery_note(so, qty, submit=True):
 
 def get_or_create_test_shopify_store(auto_fulfill_remaining_qty=0):
 	"""Get or create test Shopify Store with setting."""
-	store_name = "_Test Shopify Store"
+	store_name = "_test-store.myshopify.com"
 	if frappe.db.exists("Shopify Store", store_name):
 		store = frappe.get_doc("Shopify Store", store_name)
 		store.auto_fulfill_remaining_qty = auto_fulfill_remaining_qty

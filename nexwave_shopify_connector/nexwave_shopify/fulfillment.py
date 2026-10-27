@@ -3,8 +3,9 @@
 
 import frappe
 from frappe import _
-from frappe.utils import cstr
+from frappe.utils import cstr, flt
 
+from nexwave_shopify_connector.nexwave_shopify.fulfillment_adapter import get_fulfillment_adapter
 from nexwave_shopify_connector.nexwave_shopify.utils import create_shopify_log
 from nexwave_shopify_connector.utils.logger import get_logger
 
@@ -96,6 +97,20 @@ def sync_fulfillment(payload: dict, request_id: str | None = None, shopify_store
 
 
 def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
+	"""Create fulfillment deliveries atomically, leaving failed calls retryable."""
+	savepoint = "shopify_fulfillment_" + frappe.generate_hash(length=10)
+	frappe.db.savepoint(savepoint)
+	try:
+		return _create_delivery_notes_from_fulfillments(order, store)
+	except (frappe.QueryDeadlockError, frappe.QueryTimeoutError):
+		frappe.db.rollback()
+		raise
+	except Exception:
+		frappe.db.rollback(save_point=savepoint)
+		raise
+
+
+def _create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	"""
 	Create Delivery Notes from Shopify order fulfillments.
 
@@ -112,7 +127,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	# Find the Sales Order
 	so_name = frappe.db.get_value(
 		"Sales Order",
-		{"shopify_order_id": shopify_order_id, "docstatus": 1},
+		{"shopify_order_id": shopify_order_id, "shopify_store": store.name, "docstatus": 1},
 		"name",
 	)
 
@@ -120,7 +135,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 		# Check if SO exists but is not submitted
 		draft_so = frappe.db.get_value(
 			"Sales Order",
-			{"shopify_order_id": shopify_order_id, "docstatus": 0},
+			{"shopify_order_id": shopify_order_id, "shopify_store": store.name, "docstatus": 0},
 			"name",
 		)
 		if draft_so:
@@ -149,6 +164,18 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 		}
 
 	so = frappe.get_doc("Sales Order", so_name)
+	adapter = get_fulfillment_adapter()
+
+	warehouses = {
+		_get_warehouse_for_location(store, cstr(value.get("location_id") or "")) or store.warehouse
+		for value in order.get("fulfillments", [])
+	}
+	if adapter is not None:
+		adapter.prepare_sources(so, order, store, warehouses - {None, ""})
+	# Providers prepare source locks before order locking and retry deduplication.
+	so = frappe.get_doc("Sales Order", so_name, for_update=True)
+	if so.docstatus != 1 or so.shopify_store != store.name or so.shopify_order_id != shopify_order_id:
+		frappe.throw(_("The Shopify Sales Order changed while fulfillment was waiting. Retry the event."))
 
 	fulfillments = order.get("fulfillments", [])
 	if not fulfillments:
@@ -183,6 +210,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 	failed_count = 0
 
 	for fulfillment in fulfillments:
+		so.reload()
 		fulfillment_id = cstr(fulfillment.get("id"))
 
 		# Check if DN already exists for this fulfillment (deduplication, store-scoped)
@@ -190,6 +218,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 			"Delivery Note",
 			{"shopify_fulfillment_id": fulfillment_id, "shopify_store": store.name},
 			"name",
+			for_update=True,
 		)
 
 		if existing_dn:
@@ -217,6 +246,7 @@ def create_delivery_notes_from_fulfillments(order: dict, store) -> dict:
 			store=store,
 			shopify_order_id=shopify_order_id,
 			order=order,
+			adapter=adapter,
 		)
 
 		if dn_name:
@@ -252,6 +282,7 @@ def _create_delivery_note_from_fulfillment(
 	store,
 	shopify_order_id: str,
 	order: dict,
+	adapter=None,
 ) -> str | None:
 	"""
 	Create a single Delivery Note from a Shopify fulfillment.
@@ -315,13 +346,26 @@ def _create_delivery_note_from_fulfillment(
 		len(line_items),
 		len(so.items),
 	)
-	dn_items = _get_fulfillment_items(
-		so_items=so.items,
-		fulfillment_items=line_items,
-		warehouse=warehouse,
-		store=store,
-		so_name=so.name,
+	dn_items = (
+		adapter.get_delivery_items(so, line_items, warehouse or store.warehouse, store)
+		if adapter is not None
+		else None
 	)
+	if dn_items is not None and (
+		not isinstance(dn_items, list) or any(not isinstance(item, dict) for item in dn_items)
+	):
+		frappe.throw(_("The Shopify fulfillment adapter must return None or a list of item dictionaries."))
+	if dn_items is None:
+		dn_items = _get_fulfillment_items(
+			so_items=so.items,
+			fulfillment_items=line_items,
+			warehouse=warehouse,
+			store=store,
+			so_name=so.name,
+		)
+	else:
+		# Providers may reuse their rows across fulfillments; shipping is local.
+		dn_items = [dict(item) for item in dn_items]
 
 	# Add shipping items if configured
 	if store.add_shipping_as_item and store.shipping_item:
@@ -332,6 +376,8 @@ def _create_delivery_note_from_fulfillment(
 
 		for so_item in so.items:
 			if so_item.item_code == store.shipping_item:
+				if any(item.get("so_detail") == so_item.name for item in dn_items):
+					continue
 				qty = so_item.qty
 
 				# Check remaining qty if setting is enabled
@@ -421,82 +467,98 @@ def _get_fulfillment_items(
 	logger = get_logger()
 	dn_items = []
 
-	# Build SKU to SO item mapping
-	so_item_by_sku = {}
+	# Keep every order row; repeated SKUs can have different quantities and rates.
+	so_items_by_sku = {}
+	so_item_by_id = {}
 	for so_item in so_items:
-		item_code = so_item.item_code
-		# Get the SKU (item_code is used as SKU in the order sync)
-		so_item_by_sku[item_code] = so_item
+		so_items_by_sku.setdefault(so_item.item_code, []).append(so_item)
+		line_id = cstr(so_item.get("shopify_line_item_id")).strip()
+		if line_id:
+			if line_id in so_item_by_id:
+				raise ValueError(f"Duplicate Shopify line item ID '{line_id}' in Sales Order '{so_name}'.")
+			so_item_by_id[line_id] = so_item
 
-	# Get already-delivered quantities if auto_fulfill_remaining_qty is enabled
-	delivered_qty_map = {}
-	if store.auto_fulfill_remaining_qty:
-		delivered_qty_map = _get_delivered_qty_map(so_name)
+	# The outer gate still controls existing DNs in default mode. Refresh here
+	# because an earlier fulfillment in this payload may just have submitted a DN.
+	delivered_qty_map = _get_delivered_qty_map(so_name)
+	remaining_by_row = {
+		row.name: max(flt(row.qty) - flt(delivered_qty_map.get(row.name)), 0) for row in so_items
+	}
 
 	for f_item in fulfillment_items:
-		sku = f_item.get("sku")
-		if not sku:
-			# Try variant ID or product ID as fallback (matching order.py logic)
-			sku = cstr(f_item.get("variant_id") or f_item.get("product_id"))
+		qty = flt(f_item.get("quantity", 1))
+		if qty <= 0:
+			continue
 
-		qty = f_item.get("quantity", 1)
+		line_id = cstr(f_item.get("id")).strip()
+		if line_id and line_id in so_item_by_id:
+			# Identity survives changed SKUs and out-of-order partial fulfillments.
+			candidates = [so_item_by_id[line_id]]
+		else:
+			sku = cstr(f_item.get("sku")).strip()
+			if not sku:
+				sku = cstr(f_item.get("variant_id") or f_item.get("product_id"))
 
-		# Find matching SO item
-		if sku not in so_item_by_sku:
-			# Try to find by item_code lookup
-			item_code = frappe.db.get_value("Item", {"name": sku}) or frappe.db.get_value(
-				"Item", {"item_code": sku}
-			)
-			if item_code and item_code in so_item_by_sku:
-				sku = item_code
+			if sku not in so_items_by_sku:
+				item_code = frappe.db.get_value("Item", {"name": sku}) or frappe.db.get_value(
+					"Item", {"item_code": sku}
+				)
+				if item_code and item_code in so_items_by_sku:
+					sku = item_code
+				else:
+					logger.warning("SKU %s from fulfillment not found in Sales Order items", sku)
+					continue
+
+			# Older imports lack line IDs. Allocate those rows in order, without
+			# borrowing the price or capacity of a row with a different known ID.
+			candidates = [
+				row for row in so_items_by_sku[sku] if not cstr(row.get("shopify_line_item_id")).strip()
+			]
+			if not candidates:
+				raise ValueError(
+					f"Shopify fulfillment line '{line_id or '(missing ID)'}' does not match "
+					f"the stored line IDs for item '{sku}' in Sales Order '{so_name}'."
+				)
+
+		allocations = []
+		pending_qty = qty
+		for so_item in candidates:
+			allocated_qty = min(pending_qty, max(remaining_by_row[so_item.name], 0))
+			if allocated_qty > 0:
+				allocations.append((so_item, allocated_qty))
+				remaining_by_row[so_item.name] -= allocated_qty
+				pending_qty -= allocated_qty
+			if pending_qty <= 0:
+				break
+
+		if pending_qty > 0:
+			if store.auto_fulfill_remaining_qty:
+				logger.info(
+					"Capping fulfillment line %s by %s to remaining order quantity", line_id, pending_qty
+				)
 			else:
-				logger.warning(
-					"SKU %s from fulfillment not found in Sales Order items",
-					sku,
-				)
-				continue
+				# Preserve native over-delivery allowance/validation in default mode.
+				so_item = candidates[-1]
+				if allocations and allocations[-1][0].name == so_item.name:
+					allocations[-1] = (so_item, allocations[-1][1] + pending_qty)
+				else:
+					allocations.append((so_item, pending_qty))
+				remaining_by_row[so_item.name] -= pending_qty
 
-		so_item = so_item_by_sku[sku]
-
-		# Calculate remaining qty if setting is enabled
-		if store.auto_fulfill_remaining_qty:
-			already_delivered = delivered_qty_map.get(so_item.name, 0)
-			remaining_qty = so_item.qty - already_delivered
-
-			if remaining_qty <= 0:
-				logger.info(
-					"Skipping item %s - already fully delivered (ordered: %s, delivered: %s)",
-					so_item.item_code,
-					so_item.qty,
-					already_delivered,
-				)
-				continue
-
-			# Cap at remaining qty
-			if qty > remaining_qty:
-				logger.info(
-					"Capping qty for %s from %s to %s (already delivered: %s of %s)",
-					so_item.item_code,
-					qty,
-					remaining_qty,
-					already_delivered,
-					so_item.qty,
-				)
-				qty = remaining_qty
-
-		dn_items.append(
-			{
-				"item_code": so_item.item_code,
-				"item_name": so_item.item_name,
-				"description": so_item.description,
-				"qty": qty,
-				"rate": so_item.rate,
-				"warehouse": warehouse or store.warehouse,
-				"against_sales_order": so_item.parent,
-				"so_detail": so_item.name,
-				"cost_center": store.cost_center,
-			}
-		)
+		for so_item, allocated_qty in allocations:
+			dn_items.append(
+				{
+					"item_code": so_item.item_code,
+					"item_name": so_item.item_name,
+					"description": so_item.description,
+					"qty": allocated_qty,
+					"rate": so_item.rate,
+					"warehouse": warehouse or store.warehouse,
+					"against_sales_order": so_item.parent,
+					"so_detail": so_item.name,
+					"cost_center": store.cost_center,
+				}
+			)
 
 	return dn_items
 
@@ -566,12 +628,12 @@ def _has_existing_delivery_notes(so_name: str) -> bool:
 	Returns:
 		True if at least one DN exists
 	"""
-	return frappe.db.exists(
-		"Delivery Note Item",
-		{
-			"against_sales_order": so_name,
-			"docstatus": ["in", [0, 1]],
-		},
+	return bool(
+		frappe.db.sql(
+			"SELECT name FROM `tabDelivery Note Item` "
+			"WHERE against_sales_order=%s AND docstatus IN (0, 1) FOR UPDATE",
+			(so_name,),
+		)
 	)
 
 
@@ -587,13 +649,11 @@ def _get_delivered_qty_map(so_name: str) -> dict[str, float]:
 	Returns:
 		Dict mapping so_detail (SO Item name) → total delivered qty
 	"""
-	delivered_items = frappe.get_all(
-		"Delivery Note Item",
-		filters={
-			"against_sales_order": so_name,
-			"docstatus": 1,
-		},
-		fields=["so_detail", "qty"],
+	delivered_items = frappe.db.sql(
+		"SELECT so_detail, qty FROM `tabDelivery Note Item` "
+		"WHERE against_sales_order=%s AND docstatus=1 FOR UPDATE",
+		(so_name,),
+		as_dict=True,
 	)
 
 	delivered_qty_map = {}

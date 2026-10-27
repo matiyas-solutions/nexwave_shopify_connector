@@ -17,6 +17,10 @@ Webhook-based order ingestion with HMAC validation. Orders are automatically rou
 ### Fulfillment Sync
 Listens to Shopify fulfillment webhooks and automatically creates Delivery Notes with tracking information. Handles partial fulfillments and prevents duplicates.
 
+Uses standard ERPNext Delivery Notes by default. Other apps can register a generic [fulfillment adapter](docs/developer-guide.md#fulfillment-adapters) to supply delivery items for their own workflows. The connector owns submission, shipping, duplicate prevention and transaction rollback.
+
+New order imports retain Shopify line IDs for exact source-row resolution. Run the normal site migration when upgrading to add the hidden line-ID field.
+
 ### Product and Inventory Push
 Sync items from ERPNext to Shopify with configurable field mapping (standard fields and metafields). Push stock levels from ERPNext warehouses to Shopify locations with multi-location support.
 
@@ -38,6 +42,13 @@ Supports modern OAuth flow (recommended for new integrations) and legacy access 
 
 ### SKU-Based Migration Tool
 Link existing Shopify products to ERPNext items by matching SKUs. Generates a report of matched, unmatched, and conflicting items.
+
+### Automatic SKU Linking from Orders
+Each Shopify Store can enable **Auto-link Items from Orders by SKU** (off by default). After a successful order import, matching existing item codes are linked to the incoming Shopify product and variant. This does not create items or publish products. Disabled links are preserved; conflicting ownership is logged for manual review.
+
+Newly linked stock items are marked **Inventory Sync Pending** on their store row. If inventory sync is enabled, a background update is queued after the order and reservations commit. Both Full Inventory and Changed Bins runs retry pending links, including links whose stock has not changed. Pending clears only after all required variants and locations update successfully. Mapping non-stock items does not queue inventory updates.
+
+Run the normal site migration to add these fields. Enabling this setting does not backfill existing orders or products; use **Fetch Products & Map by SKU** to review existing mapping gaps.
 
 ### Item Eligibility Filters
 Control which items sync to which stores using manual overrides or automatic filter rules (e.g., "if field X has value, sync to store Y").
